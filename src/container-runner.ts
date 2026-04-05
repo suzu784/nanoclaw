@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -166,17 +166,6 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Gmail credentials directory (for Gmail MCP inside the container)
-  const homeDir = os.homedir();
-  const gmailDir = path.join(homeDir, '.gmail-mcp');
-  if (fs.existsSync(gmailDir)) {
-    mounts.push({
-      hostPath: gmailDir,
-      containerPath: '/home/node/.gmail-mcp',
-      readonly: false, // MCP may need to refresh OAuth tokens
-    });
-  }
-
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -204,23 +193,27 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-    }
+  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Google Workspace CLI (gws) credentials — used by gws-gmail/gws-calendar skills.
+  // Uses a container-specific copy at ~/.config/gws-container/ so the host's
+  // Keychain-encrypted ~/.config/gws/ is never touched by the container.
+  // Mounted read-write because gws writes discovery cache inside this directory.
+  const gwsContainerDir = path.join(os.homedir(), '.config', 'gws-container');
+  if (fs.existsSync(gwsContainerDir)) {
+    mounts.push({
+      hostPath: gwsContainerDir,
+      containerPath: '/home/node/.config/gws',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -253,6 +246,42 @@ async function buildContainerArgs(
   });
   if (onecliApplied) {
     logger.info({ containerName }, 'OneCLI gateway config applied');
+
+    // On macOS with Colima, os.tmpdir() returns /var/folders/... which is
+    // outside the VM's virtiofs mount (typically only /Users/ is shared).
+    // Docker silently creates an empty directory when the host path doesn't
+    // exist in the VM, breaking NODE_EXTRA_CA_CERTS / SSL_CERT_FILE.
+    // Fix: copy any /var/folders/ or /tmp/ cert files into the project's
+    // data/ directory, which is under /Users/ and accessible to the VM.
+    const caDir = path.join(DATA_DIR, 'onecli-ca');
+    fs.mkdirSync(caDir, { recursive: true });
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-v' && args[i + 1]) {
+        const parts = args[i + 1].split(':');
+        if (
+          parts.length >= 2 &&
+          parts[0].includes('onecli') &&
+          parts[0].endsWith('.pem')
+        ) {
+          const hostPath = parts[0];
+          const containerPath = parts[1];
+          const ro = parts[2] || '';
+          try {
+            const filename = path.basename(hostPath);
+            const newHostPath = path.join(caDir, filename);
+            fs.copyFileSync(hostPath, newHostPath);
+            args[i + 1] =
+              `${newHostPath}:${containerPath}${ro ? ':' + ro : ''}`;
+            logger.debug(
+              { from: hostPath, to: newHostPath },
+              'Relocated OneCLI CA cert for VM accessibility',
+            );
+          } catch (err) {
+            logger.warn({ hostPath, err }, 'Failed to relocate OneCLI CA cert');
+          }
+        }
+      }
+    }
   } else {
     logger.warn(
       { containerName },
@@ -443,15 +472,15 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      try {
-        stopContainer(containerName);
-      } catch (err) {
-        logger.warn(
-          { group: group.name, containerName, err },
-          'Graceful stop failed, force killing',
-        );
-        container.kill('SIGKILL');
-      }
+      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
+        if (err) {
+          logger.warn(
+            { group: group.name, containerName, err },
+            'Graceful stop failed, force killing',
+          );
+          container.kill('SIGKILL');
+        }
+      });
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
@@ -689,7 +718,6 @@ export function writeTasksSnapshot(
     id: string;
     groupFolder: string;
     prompt: string;
-    script?: string | null;
     schedule_type: string;
     schedule_value: string;
     status: string;
